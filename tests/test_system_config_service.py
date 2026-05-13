@@ -9,6 +9,8 @@ from types import SimpleNamespace
 from typing import Any, Dict, Optional
 from unittest.mock import Mock, patch
 
+import requests
+
 from tests.litellm_stub import ensure_litellm_stub
 
 ensure_litellm_stub()
@@ -348,6 +350,76 @@ class SystemConfigServiceTestCase(unittest.TestCase):
         )
         self.assertFalse(validation["valid"])
         self.assertTrue(any(issue["code"] == "invalid_url" for issue in validation["issues"]))
+
+    def test_validate_reports_invalid_notification_route_channel(self) -> None:
+        validation = self.service.validate(
+            items=[{"key": "NOTIFICATION_REPORT_CHANNELS", "value": "wechat,ntfy,email"}]
+        )
+        self.assertFalse(validation["valid"])
+        self.assertTrue(
+            any(
+                issue["key"] == "NOTIFICATION_REPORT_CHANNELS"
+                and issue["code"] == "invalid_allowed_value"
+                for issue in validation["issues"]
+            )
+        )
+
+    def test_validate_reports_invalid_notification_quiet_hours(self) -> None:
+        validation = self.service.validate(
+            items=[{"key": "NOTIFICATION_QUIET_HOURS", "value": "9:00-18:00"}]
+        )
+
+        self.assertFalse(validation["valid"])
+        self.assertTrue(
+            any(
+                issue["key"] == "NOTIFICATION_QUIET_HOURS"
+                and issue["code"] == "invalid_format"
+                for issue in validation["issues"]
+            )
+        )
+
+    def test_validate_reports_invalid_notification_timezone(self) -> None:
+        validation = self.service.validate(
+            items=[{"key": "NOTIFICATION_TIMEZONE", "value": "Mars/Olympus"}]
+        )
+
+        self.assertFalse(validation["valid"])
+        self.assertTrue(
+            any(
+                issue["key"] == "NOTIFICATION_TIMEZONE"
+                and issue["code"] == "invalid_timezone"
+                for issue in validation["issues"]
+            )
+        )
+
+    def test_validate_reports_invalid_notification_min_severity(self) -> None:
+        validation = self.service.validate(
+            items=[{"key": "NOTIFICATION_MIN_SEVERITY", "value": "notice"}]
+        )
+
+        self.assertFalse(validation["valid"])
+        self.assertTrue(
+            any(
+                issue["key"] == "NOTIFICATION_MIN_SEVERITY"
+                and issue["code"] == "invalid_enum"
+                for issue in validation["issues"]
+            )
+        )
+
+    def test_validate_warns_daily_digest_is_reserved(self) -> None:
+        validation = self.service.validate(
+            items=[{"key": "NOTIFICATION_DAILY_DIGEST_ENABLED", "value": "true"}]
+        )
+
+        self.assertTrue(validation["valid"])
+        self.assertTrue(
+            any(
+                issue["key"] == "NOTIFICATION_DAILY_DIGEST_ENABLED"
+                and issue["code"] == "reserved_notification_daily_digest"
+                and issue["severity"] == "warning"
+                for issue in validation["issues"]
+            )
+        )
 
     def test_validate_warns_when_feishu_app_credentials_are_used_without_webhook(self) -> None:
         validation = self.service.validate(
@@ -937,12 +1009,78 @@ class SystemConfigServiceTestCase(unittest.TestCase):
             )
 
         self.assertTrue(payload["success"])
+        self.assertIn("部分成功", payload["message"])
+        self.assertIn("1/2", payload["message"])
         self.assertEqual(len(payload["attempts"]), 2)
         self.assertFalse(payload["attempts"][0]["success"])
         self.assertTrue(payload["attempts"][1]["success"])
         self.assertIn("access_token=***", payload["attempts"][0]["target"])
         self.assertNotIn("verylongsecrettoken1234567890", payload["attempts"][1]["target"])
+        self.assertNotIn("access_token=first", str(payload))
         self.assertEqual(mock_post.call_args_list[0].kwargs["timeout"], 4)
+
+    @patch("src.notification_sender.custom_webhook_sender.requests.post")
+    def test_test_notification_channel_custom_webhook_all_failures_are_retryable(self, mock_post) -> None:
+        mock_post.side_effect = [
+            self._mock_http_response(500),
+            self._mock_http_response(429),
+        ]
+
+        with self._notification_test_env():
+            payload = self.service.test_notification_channel(
+                channel="custom",
+                items=[
+                    {
+                        "key": "CUSTOM_WEBHOOK_URLS",
+                        "value": (
+                            "https://example.com/robot/send?access_token=first,"
+                            "https://example.com/robot/send?token=second"
+                        ),
+                    }
+                ],
+                title="Test title",
+                content="hello",
+                timeout_seconds=4,
+            )
+
+        self.assertFalse(payload["success"])
+        self.assertEqual(payload["error_code"], "send_failed")
+        self.assertTrue(payload["retryable"])
+        self.assertIn("失败", payload["message"])
+        self.assertIn("0/2", payload["message"])
+        self.assertEqual(len(payload["attempts"]), 2)
+        self.assertTrue(all(attempt["retryable"] for attempt in payload["attempts"]))
+        self.assertNotIn("access_token=first", str(payload))
+        self.assertNotIn("token=second", str(payload))
+
+    @patch(
+        "src.notification_sender.WechatSender.send_to_wechat",
+        side_effect=requests.exceptions.Timeout(
+            "timeout for https://qyapi.example.com/cgi-bin/webhook/send?key=secret token=abc123"
+        ),
+    )
+    def test_test_notification_channel_classifies_escaped_timeout(self, _mock_send) -> None:
+        with self._notification_test_env():
+            payload = self.service.test_notification_channel(
+                channel="wechat",
+                items=[
+                    {
+                        "key": "WECHAT_WEBHOOK_URL",
+                        "value": "https://qyapi.example.com/cgi-bin/webhook/send?key=secret",
+                    }
+                ],
+                title="Test title",
+                content="hello",
+                timeout_seconds=3,
+            )
+
+        self.assertFalse(payload["success"])
+        self.assertEqual(payload["error_code"], "timeout")
+        self.assertTrue(payload["retryable"])
+        self.assertEqual(payload["attempts"][0]["error_code"], "timeout")
+        self.assertIn("key=***", payload["attempts"][0]["target"])
+        self.assertNotIn("key=secret", str(payload))
+        self.assertNotIn("abc123", str(payload))
 
     @patch("src.notification_sender.telegram_sender.requests.post")
     def test_test_notification_channel_masks_short_sensitive_target(self, mock_post) -> None:
